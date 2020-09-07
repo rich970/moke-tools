@@ -84,8 +84,37 @@ class moketools(object):
         self.data = data  # Overwrite the data field in the moketools object
         self.columns = data.dtype.names
 
- #   def delcolumn(self, col_name):
- #      new_dtype = self.data.dtype.descr + [(col_name, data_type)]
+    def delcolumn(self, col_name):
+        """ Method to delete a column.
+        Parameters
+        ----------
+        col_name : string
+            The name of the column to be deleted
+        data_type : The type of data included in col_data.
+
+        Returns
+        -------
+        None
+        """
+        names = list(self.data.dtype.names)  # list of column names
+        try:
+            ind = names.index(col_name)  # index of column to be deleted
+        except ValueError:  # if the column does exist...
+            print('Error: \'{0}\' is not a column'.format(col_name))
+            return
+
+        # Copy the old data types then remove the one for the deleted column
+        new_dtype = list(self.data.dtype.descr)
+        new_dtype.remove((new_dtype[ind][0], new_dtype[ind][1]))
+
+        # Create a new data area and populate with the columns we want to keep
+        data = np.empty(shape=len(self.data['index']),
+                        dtype=new_dtype)
+        for col in self.data.dtype.names:
+            if col != col_name:
+                data[col] = self.data[col]
+        self.data = data  # Overwrite the data field in the moketools object
+        self.columns = data.dtype.names
 
     def head(self, n=5):
         """ Prints the columns name and the first few lines of data.
@@ -142,13 +171,16 @@ class moketools(object):
         # find number of data columns using delimeter provided
         n_data_cols = len(re.findall(delim, regex[2]))
         # Find the numerical data line by line
+        count = 0
         for line in regex:
             dataline = np.array(re.findall('.\d*\.\d*', line))
             # only use datalines which have the right number of columns
             if np.size(dataline) == n_data_cols:
-                index.append(int(float(dataline[0])))
+             #   index.append(int(float(dataline[0])))
+                index.append(count)
                 field.append(float(dataline[1]))
                 kerrV.append(float(dataline[2]))
+                count += 1
 
         data = np.empty(shape=(len(index)),
                         dtype=[('index', int),
@@ -286,6 +318,110 @@ class moketools(object):
         Rem = np.mean(abs(self.data['normalised-Kerr'][ind]))
         return Rem
 
+    def rolling_err(self, window_size):
+        """ Calculates the standard error across a data window. This data window
+            shifts along the dataset to build a vector of errors, sampling the 
+            noise in the time series. In order to characterise the noise correctly
+            the window should be small enough that the data sample it contains is
+            insensitive to the longer timescale signal variation associated with
+            the field sweep.
+            
+            Parameters
+            ----------
+                window_size : int
+                    Size of data sampling window for each rolling error calcuation
+            Returns
+            _______
+                np.mean(err) : The average error from all the data samples.
+        """
+        err = []
+        for ind in self.data['index']:
+            # FIX - should implent cyclic iterations
+            if ind+window_size < len(self.data['index']):
+                s_window = range(ind, ind+window_size)
+                std = np.std(self.data['corrected'][s_window])
+                err.append(std/np.sqrt(window_size))
+        return np.mean(err)
+
+    def fixdrift(self, b=3, **kwargs):
+        data_window = kwargs.get('data_window', 10)
+        d_step = kwargs.get('d_step', 2)
+        plot_figs = kwargs.get('plot_figs', False)
+
+        # Create new column with the kerrV data to be corrected
+        self.addcolumn(self.data['kerrV'], 'corrected')
+
+        n = len(self.data['index'])
+        mn = np.mean(self.data['kerrV'])
+        split = round(n/2)  # Middle index of the dataset
+
+        # Estimate the noise level on the data
+        err = np.mean(moketools.rolling_err(self, data_window))
+        # Initialise the param 'mean absolute error'for assessing fit
+        mae = b*err*10
+        # Loop over and fit until the mae is comparable to the noise level
+        loop_n = 1
+        print('Attempting to offset switched region to obtain optimal fit')
+        if plot_figs:
+            plt.figure()
+
+        while mae/err > b:
+            # Fit a 2nd order polynomial to the data for use later
+            drift_params = np.polyfit(self.data['index'],
+                                      self.data['corrected'], 2)
+            model = drift_params[2] \
+                + drift_params[1]*self.data['index'] \
+                + drift_params[0]*self.data['index']**2
+
+            # Calculate the mae with this model:
+            mae = sum(abs(model-self.data['corrected'])
+                      )/len(self.data['index'])
+
+            # Now use the mae to try to compensate the switched region
+            # Find indices of the magnetisation reversal
+            diff = np.diff(self.data['corrected'])
+            i1 = abs(diff)[:split].argmax()
+            i2 = split + abs(diff)[split:].argmax()
+            self.data['corrected'][i1:i2] = (self.data['corrected'][i1:i2]
+                                             + np.sign(diff[i2])*mae*d_step)
+            if plot_figs:
+                plt.clf()
+                plt.title('Attempting to compensate switched region')
+                plt.xlabel('index')
+                plt.ylabel('kerr voltage')
+                # Plot the data so far
+                plt.plot(self.data['index'], self.data['corrected'])
+                # Where the switches were found:
+                plt.plot(self.data['index'][i1-1], self.data['corrected'][i1-1], 'ko')
+                plt.plot(self.data['index'][i2-1], self.data['corrected'][i2-1], 'ko')
+                # MAE margin lines
+                plt.plot(np.linspace(0, n, 10), mn*np.ones(10), 'k-')
+                plt.plot(np.linspace(0, n, 10), mn-mae*np.ones(10), 'k--')
+                plt.plot(np.linspace(0, n, 10), mn+mae*np.ones(10), 'k--',
+                         label='mae')
+                # The model...
+                plt.plot(self.data['index'], model, '--b')
+    
+                # How does this compare to the standard error on the data?
+                plt.plot(np.linspace(0, n, 10), mn*np.ones(10), '-')
+                plt.plot(np.linspace(0, n, 10), mn+b*err*np.ones(10), 'r--')
+                plt.plot(np.linspace(0, n, 10), mn-b*err*np.ones(10), 'r--',
+                         label='noise-level')
+                plt.legend()
+                plt.pause(0.5)
+
+            print('{0}: [MAE/noise level] = {1}'.format(loop_n, mae/err))
+            loop_n += 1
+
+            if loop_n > 20:
+                print('Unable to correct drift. Consider lowering the \
+                      threshold parameter (b)')
+                return
+        # Once the fit is decent,  we substract the drift model
+        print('Success!')
+        self.data['corrected'] = self.data['kerrV'] - model
+        plt.figure()
+        plt.plot(self.data['field'], self.data['corrected'])
 
 class wafermap(object):
     '''
